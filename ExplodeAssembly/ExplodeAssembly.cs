@@ -242,12 +242,14 @@ namespace ExplodeAssembly
         private readonly Point3d _componentsCentroid;
         private readonly List<Guid> _newInstanceIds = new List<Guid>();
         private readonly List<Guid> _centroidMarkerIds = new List<Guid>();
+        private readonly List<Guid> _connectionLineIds = new List<Guid>();
         
         private double _explosionValue = 0.0;  // Standardwert ist 0 (keine Verschiebung)
         private int _explosionMode = 0;
         private double _explosionFactor = 1.0;
         private bool _preserveHierarchy = false;
         private bool _visualizeCentroids = false;
+        private bool _visualizeConnectionLines = true;
         
         private readonly string[] _explosionModes = new string[] { "Zentrum", "Relativ", "Achsen" };
         
@@ -259,7 +261,9 @@ namespace ExplodeAssembly
         private TextBox _factorTextBox;
         private CheckBox _hierarchyCheckBox;
         private CheckBox _centroidsCheckBox;
+        private CheckBox _connectionLinesCheckBox;
         private ListBox _componentsList;
+        private Button _resetViewButton;
 
         public ExplodeAssemblyDialog(RhinoDoc doc, InstanceObject masterBlock, List<ExplosionComponent> components, 
             Point3d explosionCenter, Point3d componentsCentroid)
@@ -456,6 +460,20 @@ namespace ExplodeAssembly
             
             layout.Add(_centroidsCheckBox);
             
+            // Verbindungslinien-Checkbox
+            _connectionLinesCheckBox = new CheckBox
+            {
+                Text = "Verbindungslinien anzeigen",
+                Checked = _visualizeConnectionLines
+            };
+            _connectionLinesCheckBox.CheckedChanged += (sender, e) =>
+            {
+                _visualizeConnectionLines = _connectionLinesCheckBox.Checked ?? false;
+                UpdatePreview();
+            };
+            
+            layout.Add(_connectionLinesCheckBox);
+            
             // Komponenten-Liste
             layout.Add(new Label { Text = "Komponenten:" });
             
@@ -468,7 +486,48 @@ namespace ExplodeAssembly
                 _componentsList.Items.Add($"{comp.Instance.InstanceDefinition.Name}");
             }
             
+            // Selektiere Komponente wenn auf ListBox-Element geklickt wird
+            _componentsList.SelectedIndexChanged += (sender, e) =>
+            {
+                int selectedIndex = _componentsList.SelectedIndex;
+                if (selectedIndex >= 0 && selectedIndex < _components.Count)
+                {
+                    // Hebe die Selektion aller anderen Objekte auf
+                    _doc.Objects.UnselectAll();
+                    
+                    // Selektiere die ausgewählte Komponente
+                    var component = _components[selectedIndex];
+                    
+                    // Finde die explodierte Version der Komponente
+                    foreach (var id in _newInstanceIds)
+                    {
+                        var obj = _doc.Objects.FindId(id);
+                        if (obj is InstanceObject instObj && 
+                            instObj.InstanceDefinition.Index == component.DefinitionIndex)
+                        {
+                            // Selektiere diese Instanz
+                            obj.Select(true);
+                            
+                            // Optional: Zum ausgewählten Objekt zoomen
+                            var bbox = obj.Geometry.GetBoundingBox(true);
+                            _doc.Views.ActiveView.ActiveViewport.ZoomBoundingBox(bbox);
+                            
+                            break;
+                        }
+                    }
+                    
+                    // Aktualisiere die Ansicht
+                    _doc.Views.Redraw();
+                }
+            };
+            
             layout.Add(_componentsList);
+            
+            // Button zum Zurücksetzen der Ansicht
+            _resetViewButton = new Button { Text = "Ansicht auf Masterblock zurücksetzen" };
+            _resetViewButton.Click += (sender, e) => ResetViewToMasterBlock();
+            
+            layout.Add(_resetViewButton);
             
             // Informationen
             var infoText = new Label
@@ -492,10 +551,13 @@ namespace ExplodeAssembly
             masterBbox.Transform(_masterBlock.InstanceXform);
             Point3d explodeCenter = masterBbox.Center;
             
+            // Erstelle einen Marker-Block für die Centroide, falls er noch nicht existiert
+            int markerBlockIndex = CreateCentroidMarkerBlock();
+            
             // Visualisiere Schwerpunkte, wenn gewünscht
             if (_visualizeCentroids)
             {
-                VisualizeCentroids(explodeCenter);
+                VisualizeCentroids(explodeCenter, markerBlockIndex);
             }
             
             // Bestimme die zu verwendenden Komponenten basierend auf der Hierarchie-Einstellung
@@ -509,14 +571,9 @@ namespace ExplodeAssembly
             double maxDiagonal = masterBbox.Diagonal.Length;
             double explosionDistance = _explosionValue / 100.0 * maxDiagonal;
             
-            // -------------------------------------------------------------------------
-            // KOMPLETT NEUER ANSATZ: GEOMETRIEBASIERTE EXPLOSION
-            // -------------------------------------------------------------------------
-            
-            // 1. Erstelle eine exakte Kopie des Master-Blocks, wenn die Explosionsdistanz 0 ist
+            // Wenn keine Explosion stattfindet, erstelle eine exakte Kopie des Masterblocks
             if (Math.Abs(explosionDistance) < 1e-10)
             {
-                // Erstelle eine exakte Kopie des Master-Blocks mit identischer Transformation
                 Guid masterCopyId = _doc.Objects.AddInstanceObject(
                     _masterBlock.InstanceDefinition.Index, 
                     new Transform(_masterBlock.InstanceXform));
@@ -530,61 +587,44 @@ namespace ExplodeAssembly
                 return;
             }
             
-            // 2. Erstelle für jede Komponente eine eigene explodierte Instanz
-            // Sortiere die Komponenten nach ihrer Entfernung vom Explosionszentrum
-            var sortedComponents = new List<ExplosionComponent>(componentsToUse);
-            sortedComponents.Sort((a, b) => 
-            {
-                double distA = (a.Centroid - explodeCenter).Length;
-                double distB = (b.Centroid - explodeCenter).Length;
-                return distA.CompareTo(distB); // Aufsteigend sortieren
-            });
+            // -------------------------------------------------------------------------
+            // VERBESSERTE EXPLOSION MIT ACHSENBINDUNG
+            // -------------------------------------------------------------------------
             
-            // Der gewählte Explosionsmodus
+            // 1. Wähle das richtige Referenzzentrum basierend auf dem Explosionsmodus
+            Point3d referenceCenter;
             string explosionMode = _explosionModes[_explosionMode];
             
-            // Explosion "Radiusfaktor": bestimmt, wie weit die Komponenten vom Zentrum wegbewegt werden
-            double radiusFactor = _explosionFactor > 0 ? _explosionFactor : 1.0;
-            
-            // Erstelle eine Liste zur Vermeidung von Kollisionen
-            var occupiedPositions = new List<BoundingBox>();
-            
-            // Erstelle für jede Komponente einen eigenen Block mit explodierter Position
-            foreach (var comp in sortedComponents)
+            switch (explosionMode)
             {
-                // Die Komponentendefinition und -geometrie
-                var componentDef = comp.Instance.InstanceDefinition;
+                case "Relativ":
+                    referenceCenter = _componentsCentroid;
+                    break;
+                case "Zentrum":
+                case "Achsen":
+                default:
+                    referenceCenter = explodeCenter;
+                    break;
+            }
+            
+            // 2. Komponenten nach Symmetrie für verbesserte Erkennung gruppieren
+            var symmetryGroups = GroupComponentsBySymmetry(componentsToUse, referenceCenter);
+            
+            // 3. Berechne für jede Komponente Explosionsvektor und erstelle neue Instanz
+            Dictionary<ExplosionComponent, Guid> explodedComponents = new Dictionary<ExplosionComponent, Guid>();
+            
+            foreach (var comp in componentsToUse)
+            {
+                // Berechne Explosionsrichtung und -distanz
+                Vector3d explosionVector = CalculateExplosionVector(
+                    comp, 
+                    referenceCenter, 
+                    explosionMode, 
+                    symmetryGroups,
+                    maxDiagonal,
+                    explosionDistance);
                 
-                // Berechne die Explosionsrichtung basierend auf dem Explosionsmodus und Explosionszentrum
-                Vector3d explodeDirection = CalculateExplosionVector(comp, explodeCenter, explosionMode);
-                
-                // Berechne die Entfernung dieser Komponente vom Explosionszentrum
-                double distanceFromCenter = (comp.Centroid - explodeCenter).Length;
-                
-                // Normalisiere die Distanz für eine einheitliche Explosion
-                double normalizedDistance = maxDiagonal > 0 ? distanceFromCenter / maxDiagonal : 0;
-                normalizedDistance = Math.Max(0.001, normalizedDistance); // Verhindere Division durch 0
-                
-                // Berechne den Explosionsversatz basierend auf der normalisierten Distanz und dem Explosionsfaktor
-                double explosionDisplacement;
-                
-                if (_explosionFactor < 1.0)
-                {
-                    // Für Faktoren < 1: Stärkere Verschiebung für nahe Objekte
-                    explosionDisplacement = explosionDistance * Math.Pow(normalizedDistance, 1.0 / (1.0 + _explosionFactor));
-                }
-                else if (_explosionFactor > 1.0)
-                {
-                    // Für Faktoren > 1: Stärkere Verschiebung für entfernte Objekte
-                    explosionDisplacement = explosionDistance * Math.Pow(normalizedDistance, _explosionFactor);
-                }
-                else
-                {
-                    // Für Faktor = 1: Lineare Verschiebung
-                    explosionDisplacement = explosionDistance * normalizedDistance;
-                }
-                
-                // Verwende die Original-Transformation als Basis
+                // Verwende die Original-Transformation als Basis für die explodierte Transformation
                 Transform explodedTransform = new Transform(comp.OriginalTransform);
                 
                 // Extrahiere die Position aus der Transformation
@@ -595,135 +635,420 @@ namespace ExplodeAssembly
                 );
                 
                 // Berechne die neue Position durch Verschiebung in Explosionsrichtung
-                Point3d explodedPosition = originalPosition + explodeDirection * explosionDisplacement;
+                Point3d explodedPosition = originalPosition + explosionVector;
                 
                 // Setze die neue Position in die Transformation
                 explodedTransform[0, 3] = explodedPosition.X;
                 explodedTransform[1, 3] = explodedPosition.Y;
                 explodedTransform[2, 3] = explodedPosition.Z;
                 
-                // Erstelle eine neue Instanz mit der explodierten Transformation
+                // Erstelle die explodierte Instanz
                 Guid explodedInstanceId = _doc.Objects.AddInstanceObject(comp.DefinitionIndex, explodedTransform);
                 
                 if (explodedInstanceId != Guid.Empty)
                 {
                     _newInstanceIds.Add(explodedInstanceId);
-                    
-                    // Optional: Verbindungslinien zwischen Originalposition und explodierter Position zeichnen
-                    if (explosionDisplacement > 0.1) // Nur wenn die Verschiebung signifikant ist
-                    {
-                        var lineStart = comp.Centroid;
-                        var lineEnd = new Point3d(explodedPosition); // Konvertiere zu Point3d für die Linie
-                        
-                        // Erstelle die Verbindungslinie
-                        var line = new Line(lineStart, lineEnd);
-                        var lineAttr = new ObjectAttributes();
-                        lineAttr.ColorSource = ObjectColorSource.ColorFromObject;
-                        lineAttr.ObjectColor = System.Drawing.Color.DarkGray;
-                        
-                        var lineId = _doc.Objects.AddLine(line, lineAttr);
-                        _newInstanceIds.Add(lineId); // Zur Löschung merken
-                    }
+                    explodedComponents.Add(comp, explodedInstanceId);
                 }
             }
             
+            // Aktualisiere die Ansicht
             _doc.Views.Redraw();
-        }
-
-        // Berechnet den Explosionsvektor basierend auf Modus und Zentrum
-        private Vector3d CalculateExplosionVector(ExplosionComponent comp, Point3d explosionCenter, string explosionMode)
-        {
-            Vector3d direction;
             
-            switch (explosionMode)
+            // Visualisiere Verbindungslinien nur wenn gewünscht
+            if (_visualizeConnectionLines || _visualizeCentroids)
             {
-                case "Zentrum":
-                    // Vom Zentrum des Masterblocks zur Komponente
-                    direction = comp.Centroid - explosionCenter;
-                    break;
-                    
-                case "Relativ":
-                    // Vom Komponenten-Schwerpunkt zur Komponente
-                    direction = comp.Centroid - _componentsCentroid;
-                    break;
-                    
-                case "Achsen":
-                    // Entlang der Hauptachsen (X, Y, Z) basierend auf der Position relativ zum Explosionszentrum
-                    var relativePos = comp.Centroid - explosionCenter;
-                    
-                    // Finde die dominante Achse
-                    double absX = Math.Abs(relativePos.X);
-                    double absY = Math.Abs(relativePos.Y);
-                    double absZ = Math.Abs(relativePos.Z);
-                    
-                    if (absX >= absY && absX >= absZ)
-                        direction = new Vector3d(Math.Sign(relativePos.X), 0, 0);
-                    else if (absY >= absX && absY >= absZ)
-                        direction = new Vector3d(0, Math.Sign(relativePos.Y), 0);
-                    else
-                        direction = new Vector3d(0, 0, Math.Sign(relativePos.Z));
-                    break;
-                    
-                default:
-                    // Fallback: Vom Zentrum des Masterblocks zur Komponente
-                    direction = comp.Centroid - explosionCenter;
-                    break;
+                VisualizeExplodedComponents(explodedComponents, referenceCenter, markerBlockIndex);
             }
+        }
+        
+        // Neue Methode zum Berechnen des Explosionsvektors für eine Komponente
+        private Vector3d CalculateExplosionVector(
+            ExplosionComponent comp, 
+            Point3d referenceCenter, 
+            string explosionMode, 
+            Dictionary<string, List<ExplosionComponent>> symmetryGroups,
+            double maxDiagonal,
+            double explosionDistance)
+        {
+            // 1. Bestimme den Richtungsvektor vom Bezugszentrum zur Komponente
+            Vector3d baseDirection = comp.Centroid - referenceCenter;
             
-            // Wenn die Richtung Null ist (Komponente im Zentrum), verwende eine deterministische Richtung
-            if (direction.IsZero)
+            // Wenn der Vektor zu klein ist, generiere eine zufällige Richtung
+            if (baseDirection.Length < 1e-10)
             {
-                // Deterministische Zufallsrichtung basierend auf der Instanz-ID
                 int hash = comp.Instance.Id.GetHashCode();
                 var random = new Random(hash);
-                direction = new Vector3d(
+                baseDirection = new Vector3d(
                     random.NextDouble() * 2 - 1,
                     random.NextDouble() * 2 - 1,
                     random.NextDouble() * 2 - 1
                 );
             }
             
-            // Normalisiere den Richtungsvektor
-            if (!direction.Unitize())
-            {
-                // Wenn die Unitize-Operation fehlschlägt (sehr unwahrscheinlich), Standardrichtung
-                direction = new Vector3d(0, 0, 1);
-            }
+            // Überprüfen auf Achsenausrichtung
+            bool isAlignedWithXAxis = CheckAxisAlignment(baseDirection, new Vector3d(1, 0, 0));
+            bool isAlignedWithYAxis = CheckAxisAlignment(baseDirection, new Vector3d(0, 1, 0));
+            bool isAlignedWithZAxis = CheckAxisAlignment(baseDirection, new Vector3d(0, 0, 1));
             
-            return direction;
-        }
-
-        // Visualisiert die Zentrumspunkte
-        private void VisualizeCentroids(Point3d masterCenter)
+            Vector3d explodeDirection;
+            
+            // Wenn Komponente auf einer der Hauptachsen liegt, bewege nur entlang dieser Achse
+            if (isAlignedWithXAxis)
             {
-                // Visualisiere das Explosionszentrum
-            var centerSphere = new Sphere(masterCenter, 5.0);
-                var centerAttr = new ObjectAttributes();
-                centerAttr.ColorSource = ObjectColorSource.ColorFromObject;
-                centerAttr.ObjectColor = System.Drawing.Color.Red;
-                var centerId = _doc.Objects.AddSphere(centerSphere, centerAttr);
-                _centroidMarkerIds.Add(centerId);
-                
-                // Visualisiere den Komponenten-Schwerpunkt
-                var compCenterSphere = new Sphere(_componentsCentroid, 5.0);
-                var compCenterAttr = new ObjectAttributes();
-                compCenterAttr.ColorSource = ObjectColorSource.ColorFromObject;
-                compCenterAttr.ObjectColor = System.Drawing.Color.Blue;
-                var compCenterId = _doc.Objects.AddSphere(compCenterSphere, compCenterAttr);
-                _centroidMarkerIds.Add(compCenterId);
-                
-                // Visualisiere die Schwerpunkte der einzelnen Komponenten
-                foreach (var comp in _components)
-                {
-                    var compSphere = new Sphere(comp.Centroid, 2.0);
-                    var compAttr = new ObjectAttributes();
-                    compAttr.ColorSource = ObjectColorSource.ColorFromObject;
-                    compAttr.ObjectColor = System.Drawing.Color.Green;
-                    var id = _doc.Objects.AddSphere(compSphere, compAttr);
-                    _centroidMarkerIds.Add(id);
+                explodeDirection = new Vector3d(Math.Sign(baseDirection.X), 0, 0);
+            }
+            else if (isAlignedWithYAxis)
+            {
+                explodeDirection = new Vector3d(0, Math.Sign(baseDirection.Y), 0);
+            }
+            else if (isAlignedWithZAxis)
+            {
+                explodeDirection = new Vector3d(0, 0, Math.Sign(baseDirection.Z));
+            }
+            else
+            {
+                // Für nicht-achsausgerichtete Komponenten:
+                    switch (explosionMode)
+                    {
+                    case "Achsen":
+                        // Im Achsenmodus: explodieren entlang der stärksten Achsenrichtung
+                        explodeDirection = GetDominantAxisDirection(baseDirection);
+                            break;
+                            
+                    case "Zentrum":
+                        case "Relativ":
+                    default:
+                        // Im Standard-Modus: Verwende die normalisierte Richtung
+                        explodeDirection = baseDirection;
+                        explodeDirection.Unitize();
+                            break;
                 }
             }
             
+            // 3. Berechne den Explosionsversatz basierend auf der Distanz zum Zentrum und dem Faktor
+            double distanceFromCenter = baseDirection.Length;
+            double normalizedDistance = maxDiagonal > 0 ? distanceFromCenter / maxDiagonal : 0;
+            normalizedDistance = Math.Max(0.001, normalizedDistance);
+            
+            double explosionDisplacement;
+            
+            if (_explosionFactor < 1.0)
+            {
+                explosionDisplacement = explosionDistance * Math.Pow(normalizedDistance, 1.0 / (1.0 + _explosionFactor));
+            }
+            else if (_explosionFactor > 1.0)
+            {
+                explosionDisplacement = explosionDistance * Math.Pow(normalizedDistance, _explosionFactor);
+            }
+            else
+            {
+                explosionDisplacement = explosionDistance * normalizedDistance;
+            }
+            
+            // 4. Berechne den finalen Explosionsvektor
+            return explodeDirection * explosionDisplacement;
+        }
+        
+        // Neue Hilfsmethode zur Überprüfung der Achsenausrichtung
+        private bool CheckAxisAlignment(Vector3d direction, Vector3d axis)
+        {
+            // Normalisiere die Vektoren
+            Vector3d normDirection = new Vector3d(direction);
+            normDirection.Unitize();
+            
+            Vector3d normAxis = new Vector3d(axis);
+            normAxis.Unitize();
+            
+            // Berechne das Kreuzprodukt - wenn die Vektoren (fast) parallel sind, ist das Kreuzprodukt (fast) Null
+            Vector3d cross = Vector3d.CrossProduct(normDirection, normAxis);
+            Vector3d negCross = Vector3d.CrossProduct(normDirection, -normAxis); // Prüfe auch die entgegengesetzte Richtung
+            
+            // Eine großzügigere Toleranz für die Achsenausrichtung
+            const double alignmentTolerance = 0.05;
+            
+            return cross.Length < alignmentTolerance || negCross.Length < alignmentTolerance;
+        }
+        
+        // Methode zur Ermittlung der dominanten Achsenrichtung
+        private Vector3d GetDominantAxisDirection(Vector3d direction)
+        {
+            double absX = Math.Abs(direction.X);
+            double absY = Math.Abs(direction.Y);
+            double absZ = Math.Abs(direction.Z);
+            
+            // Bestimme die dominante Achse
+                            if (absX >= absY && absX >= absZ)
+            {
+                return new Vector3d(Math.Sign(direction.X), 0, 0);
+            }
+                            else if (absY >= absX && absY >= absZ)
+            {
+                return new Vector3d(0, Math.Sign(direction.Y), 0);
+            }
+            else
+            {
+                return new Vector3d(0, 0, Math.Sign(direction.Z));
+            }
+        }
+        
+        // Methode zur Gruppierung von Komponenten nach Symmetrieachsen
+        private Dictionary<string, List<ExplosionComponent>> GroupComponentsBySymmetry(
+            List<ExplosionComponent> components, 
+            Point3d center)
+        {
+            var groups = new Dictionary<string, List<ExplosionComponent>>();
+            
+            // Für jede Komponente
+            foreach (var comp in components)
+            {
+                // Bestimme die Position relativ zum Zentrum
+                Vector3d relPos = comp.Centroid - center;
+                
+                // Runde die Koordinaten auf eine definierte Genauigkeit für die Symmetrieerkennung
+                const int precision = 3; // 3 Dezimalstellen
+                double x = Math.Round(relPos.X, precision);
+                double y = Math.Round(relPos.Y, precision);
+                double z = Math.Round(relPos.Z, precision);
+                
+                // Erzeuge verschiedene Schlüssel für die Symmetrieprüfung
+                
+                // 1. X-Achsensymmetrie: nur das Vorzeichen von X unterscheidet sich
+                string xAxisKey = String.Format("X:{0:F" + precision + "}|Y:{1:F" + precision + "}|Z:{2:F" + precision + "}", 
+                    Math.Abs(x), y, z);
+                
+                // 2. Y-Achsensymmetrie: nur das Vorzeichen von Y unterscheidet sich
+                string yAxisKey = String.Format("X:{0:F" + precision + "}|Y:{1:F" + precision + "}|Z:{2:F" + precision + "}", 
+                    x, Math.Abs(y), z);
+                
+                // 3. Z-Achsensymmetrie: nur das Vorzeichen von Z unterscheidet sich
+                string zAxisKey = String.Format("X:{0:F" + precision + "}|Y:{1:F" + precision + "}|Z:{2:F" + precision + "}", 
+                    x, y, Math.Abs(z));
+                
+                // Bestimme auch die Hauptachse für die Komponente
+                string mainAxis = GetMainAxisKey(relPos);
+                
+                // Füge die Komponente zu den entsprechenden Gruppen hinzu
+                if (!groups.ContainsKey(xAxisKey)) groups[xAxisKey] = new List<ExplosionComponent>();
+                if (!groups.ContainsKey(yAxisKey)) groups[yAxisKey] = new List<ExplosionComponent>();
+                if (!groups.ContainsKey(zAxisKey)) groups[zAxisKey] = new List<ExplosionComponent>();
+                if (!groups.ContainsKey(mainAxis)) groups[mainAxis] = new List<ExplosionComponent>();
+                
+                groups[xAxisKey].Add(comp);
+                groups[yAxisKey].Add(comp);
+                groups[zAxisKey].Add(comp);
+                groups[mainAxis].Add(comp);
+            }
+            
+            return groups;
+        }
+        
+        // Bestimmt den Hauptachsenschlüssel einer Komponente
+        private string GetMainAxisKey(Vector3d direction)
+        {
+            double absX = Math.Abs(direction.X);
+            double absY = Math.Abs(direction.Y);
+            double absZ = Math.Abs(direction.Z);
+            
+            // Bestimme, ob die Komponente nahe einer Hauptachse liegt
+            const double axisAlignmentTolerance = 0.05;
+            
+            if (absY < axisAlignmentTolerance && absZ < axisAlignmentTolerance)
+            {
+                return "MainAxis:X:" + Math.Sign(direction.X);
+            }
+            else if (absX < axisAlignmentTolerance && absZ < axisAlignmentTolerance)
+            {
+                return "MainAxis:Y:" + Math.Sign(direction.Y);
+            }
+            else if (absX < axisAlignmentTolerance && absY < axisAlignmentTolerance)
+            {
+                return "MainAxis:Z:" + Math.Sign(direction.Z);
+            }
+            
+            // Wenn keine klare Hauptachse erkannt wird, verwende die dominante Achse
+            if (absX >= absY && absX >= absZ)
+            {
+                return "DominantAxis:X:" + Math.Sign(direction.X);
+            }
+            else if (absY >= absX && absY >= absZ)
+            {
+                return "DominantAxis:Y:" + Math.Sign(direction.Y);
+            }
+            else
+            {
+                return "DominantAxis:Z:" + Math.Sign(direction.Z);
+            }
+        }
+        
+        // Methode zur Visualisierung der explodierten Komponenten
+        private void VisualizeExplodedComponents(
+            Dictionary<ExplosionComponent, Guid> explodedComponents,
+            Point3d referenceCenter,
+            int markerBlockIndex)
+        {
+            // Für jede explodierte Komponente
+            foreach (var pair in explodedComponents)
+            {
+                var comp = pair.Key;
+                var explodedId = pair.Value;
+                
+                // Lade das explodierte Objekt
+                var explodedObj = _doc.Objects.FindId(explodedId);
+                if (explodedObj == null || !explodedObj.IsValid)
+                    continue;
+                
+                // Berechne den tatsächlichen Centroid des explodierten Objekts
+                BoundingBox explodedBBox = explodedObj.Geometry.GetBoundingBox(true);
+                Point3d actualCentroid = explodedBBox.Center;
+                
+                // Erstelle einen roten Marker am tatsächlichen Centroid mit dem vordefinierten Block
+                if (_visualizeCentroids)
+                {
+                    Transform markerTransform = Transform.Translation(actualCentroid.X, actualCentroid.Y, actualCentroid.Z);
+                    var markerAttr = new ObjectAttributes();
+                    markerAttr.ColorSource = ObjectColorSource.ColorFromObject;
+                    markerAttr.ObjectColor = System.Drawing.Color.Red;
+                    
+                    var centroidId = _doc.Objects.AddInstanceObject(markerBlockIndex, markerTransform, markerAttr);
+                    _centroidMarkerIds.Add(centroidId);
+                    _newInstanceIds.Add(centroidId);
+                }
+                
+                // Erstelle eine gelbe Linie vom Referenzzentrum zum tatsächlichen Centroid
+                if (_visualizeConnectionLines)
+                {
+                    // Berechne Richtungsvektor vom Referenzzentrum zur Komponente
+                    Vector3d directionVector = actualCentroid - referenceCenter;
+                    
+                    // Wenn der Komponent auf einer Achse liegt, erzwinge die Verbindungslinie entlang dieser Achse
+                    if (CheckAxisAlignment(directionVector, new Vector3d(1, 0, 0)))
+                    {
+                        // X-Achsenausrichtung - Verbindungslinie strikt auf X-Achse
+                        Point3d lineMidpoint = new Point3d(
+                            actualCentroid.X, 
+                            referenceCenter.Y, 
+                            referenceCenter.Z);
+                        
+                        AddConnectionLine(referenceCenter, lineMidpoint, System.Drawing.Color.Yellow);
+                        AddConnectionLine(lineMidpoint, actualCentroid, System.Drawing.Color.Yellow);
+                    }
+                    else if (CheckAxisAlignment(directionVector, new Vector3d(0, 1, 0)))
+                    {
+                        // Y-Achsenausrichtung - Verbindungslinie strikt auf Y-Achse
+                        Point3d lineMidpoint = new Point3d(
+                            referenceCenter.X, 
+                            actualCentroid.Y, 
+                            referenceCenter.Z);
+                        
+                        AddConnectionLine(referenceCenter, lineMidpoint, System.Drawing.Color.Yellow);
+                        AddConnectionLine(lineMidpoint, actualCentroid, System.Drawing.Color.Yellow);
+                    }
+                    else if (CheckAxisAlignment(directionVector, new Vector3d(0, 0, 1)))
+                    {
+                        // Z-Achsenausrichtung - Verbindungslinie strikt auf Z-Achse
+                        Point3d lineMidpoint = new Point3d(
+                            referenceCenter.X, 
+                            referenceCenter.Y, 
+                            actualCentroid.Z);
+                        
+                        AddConnectionLine(referenceCenter, lineMidpoint, System.Drawing.Color.Yellow);
+                        AddConnectionLine(lineMidpoint, actualCentroid, System.Drawing.Color.Yellow);
+                    }
+                    else
+                    {
+                        // Standardfall: Direkte Linie vom Referenzzentrum zum Centroid
+                        AddConnectionLine(referenceCenter, actualCentroid, System.Drawing.Color.Yellow);
+                    }
+                }
+            }
+        }
+        
+        // Hilfsmethode zum Hinzufügen einer Verbindungslinie
+        private void AddConnectionLine(Point3d start, Point3d end, System.Drawing.Color color)
+        {
+            var line = new Line(start, end);
+            var lineAttr = new ObjectAttributes();
+            lineAttr.ColorSource = ObjectColorSource.ColorFromObject;
+            lineAttr.ObjectColor = color;
+            var lineId = _doc.Objects.AddLine(line, lineAttr);
+            _newInstanceIds.Add(lineId);
+            _connectionLineIds.Add(lineId);
+        }
+
+        // Erstellt einen Block für den Centroid-Marker, wenn er noch nicht existiert
+        private int CreateCentroidMarkerBlock()
+        {
+            string blockName = "CentroidMarker";
+            
+            // Prüfe, ob der Block bereits existiert
+            for (int i = 0; i < _doc.InstanceDefinitions.Count; i++)
+            {
+                if (_doc.InstanceDefinitions[i].Name == blockName)
+                    return i;
+            }
+            
+            // Erstelle eine Kugel als Geometrie für den Block
+            var sphere = new Sphere(Point3d.Origin, 3.0);
+            var sphereMesh = Mesh.CreateFromSphere(sphere, 8, 6);
+            
+            // Erstelle das Attribut-Objekt
+            var attributes = new ObjectAttributes();
+            attributes.ColorSource = ObjectColorSource.ColorFromObject;
+            attributes.ObjectColor = System.Drawing.Color.Red;
+            
+            // Listen für Geometrie und Attribute erstellen
+            var geometryList = new List<GeometryBase> { sphereMesh };
+            var attributesList = new List<ObjectAttributes> { attributes };
+            
+            // Erstelle den Block mit der richtigen API-Signatur
+            int blockIndex = _doc.InstanceDefinitions.Add(
+                blockName, 
+                "Marker für Zentrum", 
+                Point3d.Origin, 
+                geometryList, 
+                attributesList);
+            
+            return blockIndex;
+        }
+
+        // Visualisiert die Zentrumspunkte
+        private void VisualizeCentroids(Point3d masterCenter, int markerBlockIndex)
+        {
+            if (markerBlockIndex < 0)
+                return;
+            
+            // Visualisiere das Explosionszentrum mit dem Block
+            Transform centerTransform = Transform.Translation(masterCenter.X, masterCenter.Y, masterCenter.Z);
+            var centerAttr = new ObjectAttributes();
+            centerAttr.ColorSource = ObjectColorSource.ColorFromObject;
+            centerAttr.ObjectColor = System.Drawing.Color.Red;
+            
+            var centerId = _doc.Objects.AddInstanceObject(markerBlockIndex, centerTransform, centerAttr);
+            _centroidMarkerIds.Add(centerId);
+            
+            // Visualisiere den Komponenten-Schwerpunkt mit dem Block
+            Transform compCenterTransform = Transform.Translation(_componentsCentroid.X, _componentsCentroid.Y, _componentsCentroid.Z);
+            var compCenterAttr = new ObjectAttributes();
+            compCenterAttr.ColorSource = ObjectColorSource.ColorFromObject;
+            compCenterAttr.ObjectColor = System.Drawing.Color.Blue;
+            
+            var compCenterId = _doc.Objects.AddInstanceObject(markerBlockIndex, compCenterTransform, compCenterAttr);
+            _centroidMarkerIds.Add(compCenterId);
+            
+            // Visualisiere die Schwerpunkte der einzelnen Komponenten mit dem Block
+            foreach (var comp in _components)
+            {
+                Transform compTransform = Transform.Translation(comp.Centroid.X, comp.Centroid.Y, comp.Centroid.Z);
+                var compAttr = new ObjectAttributes();
+                compAttr.ColorSource = ObjectColorSource.ColorFromObject;
+                compAttr.ObjectColor = System.Drawing.Color.Green;
+                
+                var id = _doc.Objects.AddInstanceObject(markerBlockIndex, compTransform, compAttr);
+                _centroidMarkerIds.Add(id);
+            }
+        }
+
         // Filtert die zu verwendenden Komponenten basierend auf den Hierarchieeinstellungen
         private List<ExplosionComponent> GetComponentsToUse()
         {
@@ -760,6 +1085,13 @@ namespace ExplodeAssembly
                 _doc.Objects.Delete(id, true);
             }
             _centroidMarkerIds.Clear();
+            
+            // Lösche alle Verbindungslinien
+            foreach (var id in _connectionLineIds)
+            {
+                _doc.Objects.Delete(id, true);
+            }
+            _connectionLineIds.Clear();
             
             _doc.Views.Redraw();
         }
@@ -844,6 +1176,21 @@ namespace ExplodeAssembly
             }
         }
 
+        // Neue Methode zum Zurücksetzen der Ansicht auf den Masterblock
+        private void ResetViewToMasterBlock()
+        {
+            // Berechne die Bounding Box des Masterblocks
+            var masterBbox = _masterBlock.Geometry.GetBoundingBox(true);
+            masterBbox.Transform(_masterBlock.InstanceXform);
+            
+            // Füge etwas Platz hinzu, damit der Masterblock vollständig sichtbar ist
+            masterBbox.Inflate(masterBbox.Diagonal.Length * 0.1);
+            
+            // Zoome zur Bounding Box
+            _doc.Views.ActiveView.ActiveViewport.ZoomBoundingBox(masterBbox);
+            _doc.Views.Redraw();
+        }
+
         protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
         {
             // Aufräumen beim Schließen
@@ -851,7 +1198,6 @@ namespace ExplodeAssembly
             base.OnClosing(e);
         }
     }
-
     public class ExplosionComponent
     {
         public InstanceObject Instance { get; set; }
