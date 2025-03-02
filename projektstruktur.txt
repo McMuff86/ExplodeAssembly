@@ -1,0 +1,40 @@
+Zuletzt aktualisiert: 2025-03-02 02:18
+
+ExplodeAssembly - Kopie (Hauptprojektordner)
+|
+|- ExplodeAssembly/
+|  |- ExplodeAssembly.cs (Hauptklasse mit der Explosionsfunktionalität)
+|  |- ExplodeAssemblyPlugin.cs (Plugin-Definition für Rhino)
+|  |
+|  |- .vscode/ (VS Code Konfigurationen)
+|  |
+|  |- bin/
+|  |  |- Debug/
+|  |     |- net48/ (Kompilierte Dateien für .NET Framework 4.8)
+|  |     |- net7.0/ (Kompilierte Dateien für .NET 7.0)
+|  |
+|  |- EmbeddedResources/ (Eingebettete Ressourcen für das Plugin)
+|  |
+|  |- obj/ (Temporäre Build-Dateien)
+|  |  |- Debug/
+|  |     |- net48/ (Kompilierte Objekte für .NET Framework 4.8)
+|  |     |- net7.0/ (Kompilierte Objekte für .NET 7.0)
+|  |        |- ref/
+|  |        |- refint/
+|  |
+|  |- Properties/ (Assemblydaten und Eigenschaften)
+|
+|- thoughtprocess/ (Dokumentation des Entwicklungsprozesses)
+|  |- README.md (Dokumentation zum Inhalt des Ordners)
+|  |
+|  |- 01_ExplodeAssembly.cs (Code-Version für den ersten Entwicklungsschritt)
+|  |- 01_ExplodeAssembly_Denkprozess.txt (Dokumentation zum allgemeinen Denkprozess)
+|  |
+|  |- 02_ExplodeAssembly.cs (Code-Version für den zweiten Entwicklungsschritt)
+|  |- 02_Verbindungslinien_Analyse.txt (Analyse der Verbindungslinienproblematik)
+|  |
+|  |- 03_ExplodeAssembly.cs (Code-Version für den dritten Entwicklungsschritt)
+|  |- 03_Kamera_Anpassung.txt (Dokumentation zur Kameraanpassungsfunktion)
+|
+|- AI_README.md (Anweisungen für den AI Coding Agent)
+|- projektstruktur.txt (Diese Datei - Übersicht der Projektstruktur) 
